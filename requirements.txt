@@ -46,7 +46,7 @@ opencv-python-headless==4.13.0.92
 opt-einsum==3.3.0
 packaging==26.0
 paddleocr==3.4.0
-paddlepaddle==3.3.0
+paddlepaddle==2.6.1
 paddlex==3.4.2
 pandas==3.0.1
 pdf2image==1.17.0
