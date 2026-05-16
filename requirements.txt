@@ -79,8 +79,8 @@ shellingham==1.5.4
 six==1.17.0
 sympy==1.14.0
 tifffile==2026.3.3
-torch==2.10.0
-torchvision==0.25.0
+torch==2.1.0 
+torchvision==0.16.0
 tqdm==4.67.3
 typer==0.24.1
 typing-inspection==0.4.2
