@@ -12,7 +12,14 @@ const { runOCR } = require("./services/easyocrService");
 const supabase   = require("./config/supabase");
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: [
+    'https://impacgodeveloper.github.io', 
+    'http://localhost:3000' // Keep your local dev environment working too
+  ],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 
 if (!fs.existsSync("uploads")) fs.mkdirSync("uploads");
