@@ -88,9 +88,7 @@ function runOCR(imagePath) {
     const scriptPath = path.join(__dirname, "..", "python", "easyocr_reader.py");
 
     // 3. Dynamically set the python path based on the environment
-    const pythonExecutable = process.env.RENDER 
-      ? 'python3' 
-      : '/Users/impacgo/Downloads/archiquant_dashboard/backend/venv/bin/python';
+    const pythonExecutable = '/usr/bin/python3';
 
     // 4. Spawn the process (Using 'py' so it hooks into your listeners below)
     const py = spawn(pythonExecutable, [scriptPath, absoluteImagePath]);
