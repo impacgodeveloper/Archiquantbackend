@@ -7,12 +7,15 @@ function runOCR(imagePath) {
     // Ensure the path is absolute (Fixes frontend upload path issues)
     const absoluteImagePath = path.resolve(imagePath);
     
-    const script = path.join(__dirname, "../python/easyocr_reader.py");
+//     const script = path.join(__dirname, "../python/easyocr_reader.py");
 
-  const py = spawn(
-  process.env.PYTHON_PATH || "python3",
-  [script, absoluteImagePath]
-);
+//   const py = spawn(
+//   process.env.PYTHON_PATH || "python3",
+//   [script, absoluteImagePath]
+// );
+const script = path.join(__dirname, "../python/easyocr_reader.py");
+
+   const py = spawn("python", [script, absoluteImagePath]);
     let output = "";
     let error = "";
 
