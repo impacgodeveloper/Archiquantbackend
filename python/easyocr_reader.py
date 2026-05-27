@@ -1,362 +1,348 @@
-import argparse
-import base64
-import json
-import sys
-import os
+import cv2
+import easyocr
 import re
-import urllib.request
-import urllib.error
- 
-# ─────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-MODEL             = "claude-opus-4-5"
-MAX_TOKENS        = 4096
- 
-# ─────────────────────────────────────────────
-#  PROMPT
-# ─────────────────────────────────────────────
-SYSTEM_PROMPT = """You are an expert architectural floor plan analyser.
-Your job is to read a floor plan image and output ONLY a valid JSON object —
-no explanation, no markdown fences, no extra text.
- 
-Identify and label:
-  - External walls  → ew1, ew2, ew3 ... (north=ew1, east=ew2, south=ew3, west=ew4; ew5+ for extra outer walls)
-  - Internal walls  → iw1, iw2, iw3 ...
-  - Doors           → d1, d2, d3 ...
-  - Windows         → w1, w2, w3 ...
-  - Zones/Rooms     → use the visible room label as the key (e.g. "MBR", "KITCHEN", "LIVING")
- 
-For EACH external wall list every element physically attached to or opening through it:
-  - windows cut into it
-  - doors cut into it
-  - internal walls that meet/intersect it
- 
-For EACH internal wall list:
-  - which external walls it connects (starts/ends at)
-  - doors or windows cut through it
- 
-For EACH zone/room list:
-  - connected_external_walls: all external walls that form its boundary
-  - connected_internal_walls: all internal walls that form its boundary
-  - total_walls_connected: count of external + internal walls bounding this zone
-  - windows: windows that open into this zone
-  - doors: doors that open into this zone
- 
-Output schema (strict JSON, no trailing commas, use null for unknowns):
-{
-  "external_walls": {
-    "ew1": {
-      "id": "ew1",
-      "position": "north",
-      "length": null,
-      "thickness": null,
-      "height": null,
-      "connected": {
-        "windows": [],
-        "doors": [],
-        "internal_walls": []
-      }
-    }
-  },
-  "internal_walls": {
-    "iw1": {
-      "id": "iw1",
-      "length": null,
-      "thickness": null,
-      "height": null,
-      "connects_external": [],
-      "connected": {
-        "doors": [],
-        "windows": []
-      }
-    }
-  },
-  "doors": {
-    "d1": {
-      "id": "d1",
-      "width": null,
-      "height": null,
-      "swing": null,
-      "on_wall": "<wall_id>"
-    }
-  },
-  "windows": {
-    "w1": {
-      "id": "w1",
-      "width": null,
-      "height": null,
-      "on_wall": "<wall_id>"
-    }
-  },
-  "zones": {
-    "MBR": {
-      "id": "MBR",
-      "label": "<full room label visible in plan>",
-      "connected_external_walls": [],
-      "connected_internal_walls": [],
-      "total_walls_connected": 0,
-      "windows": [],
-      "doors": []
-    }
-  },
-  "summary": {
-    "total_external_walls": 0,
-    "total_internal_walls": 0,
-    "total_doors": 0,
-    "total_windows": 0,
-    "total_zones": 0
-  }
-}
- 
-Rules:
-- Use null (not "null") for unknown values.
-- If a dimension label is visible (e.g. T=9, H=10, L=20, D=3x7, W=4x4), extract it.
-- zones keys must be short room codes (e.g. MBR, KIT, LIV); put the full label in the "label" field.
-- total_walls_connected = len(connected_external_walls) + len(connected_internal_walls).
-- Never add keys not in the schema above.
-- Output raw JSON only.
-"""
- 
-USER_PROMPT = "Analyse this floor plan and output the JSON as instructed."
- 
- 
-# ─────────────────────────────────────────────
-#  HELPERS
-# ─────────────────────────────────────────────
- 
-def encode_image(path: str) -> tuple[str, str]:
-    """Return (base64_data, media_type)."""
-    ext = os.path.splitext(path)[1].lower()
-    mime_map = {
-        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-        ".png": "image/png",  ".gif": "image/gif",
-        ".webp": "image/webp",
-    }
-    media_type = mime_map.get(ext, "image/jpeg")
-    with open(path, "rb") as f:
-        data = base64.standard_b64encode(f.read()).decode("utf-8")
-    return data, media_type
- 
- 
-def call_claude_vision(image_path: str, api_key: str) -> dict:
-    """Send image to Claude Vision and return parsed JSON dict."""
-    img_data, media_type = encode_image(image_path)
- 
-    payload = json.dumps({
-        "model": MODEL,
-        "max_tokens": MAX_TOKENS,
-        "system": SYSTEM_PROMPT,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": img_data,
-                        },
-                    },
-                    {"type": "text", "text": USER_PROMPT},
-                ],
-            }
-        ],
-    }).encode("utf-8")
- 
-    req = urllib.request.Request(
-        ANTHROPIC_API_URL,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        },
-        method="POST",
-    )
- 
-    try:
-        with urllib.request.urlopen(req) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8")
-        raise RuntimeError(f"API error {e.code}: {body}") from e
- 
-    response_text = raw["content"][0]["text"]
- 
-    # Strip accidental markdown fences
-    response_text = re.sub(r"^```(json)?\s*", "", response_text)
-    response_text = re.sub(r"\s*```$", "", response_text)
-    response_text = response_text.strip()
- 
-    try:
-        result = json.loads(response_text)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(
-            f"Claude returned non-JSON output.\n"
-            f"Parse error: {e}\n"
-            f"Raw response:\n{response_text[:800]}"
-        ) from e
- 
-    return result
- 
- 
-def post_process(data: dict) -> dict:
-    """
-    Ensure cross-references are consistent and compute zone wall counts.
-    - Back-fill door/window on_wall → wall connected lists
-    - Deduplicate all connected lists
-    - Recompute total_walls_connected for every zone
-    - Recompute all summary counts
-    """
-    ew      = data.get("external_walls", {})
-    iw      = data.get("internal_walls", {})
-    doors   = data.get("doors", {})
-    windows = data.get("windows", {})
-    zones   = data.get("zones", {})
- 
-    # ── Back-fill: door on_wall → wall connected.doors ───────────────────
-    for d_id, d_info in doors.items():
-        wall_id = d_info.get("on_wall")
-        if wall_id:
-            wall = ew.get(wall_id) or iw.get(wall_id)
-            if wall:
-                conn = wall.setdefault("connected", {})
-                conn.setdefault("doors", [])
-                if d_id not in conn["doors"]:
-                    conn["doors"].append(d_id)
- 
-    # ── Back-fill: window on_wall → wall connected.windows ───────────────
-    for w_id, w_info in windows.items():
-        wall_id = w_info.get("on_wall")
-        if wall_id:
-            wall = ew.get(wall_id) or iw.get(wall_id)
-            if wall:
-                conn = wall.setdefault("connected", {})
-                conn.setdefault("windows", [])
-                if w_id not in conn["windows"]:
-                    conn["windows"].append(w_id)
- 
-    # ── Zone wall-count enforcement ───────────────────────────────────────
-    for zone_id, zone_info in zones.items():
-        ext_list = zone_info.get("connected_external_walls", [])
-        int_list = zone_info.get("connected_internal_walls", [])
- 
-        # Deduplicate (safety guard against duplicate wall IDs)
-        zone_info["connected_external_walls"] = list(dict.fromkeys(ext_list))
-        zone_info["connected_internal_walls"] = list(dict.fromkeys(int_list))
- 
-        # Also deduplicate doors and windows within the zone
-        zone_info["windows"] = list(dict.fromkeys(zone_info.get("windows", [])))
-        zone_info["doors"]   = list(dict.fromkeys(zone_info.get("doors", [])))
- 
-        # Always recompute total_walls_connected from actual lists
-        zone_info["total_walls_connected"] = (
-            len(zone_info["connected_external_walls"]) +
-            len(zone_info["connected_internal_walls"])
-        )
- 
-    # ── Recompute summary counts ──────────────────────────────────────────
-    summary = data.setdefault("summary", {})
-    summary["total_external_walls"] = len(ew)
-    summary["total_internal_walls"] = len(iw)
-    summary["total_doors"]          = len(doors)
-    summary["total_windows"]        = len(windows)
-    summary["total_zones"]          = len(zones)
- 
-    return data
- 
- 
-def print_topology(data: dict):
-    """Human-readable topology summary printed to stderr for debug."""
-    ew      = data.get("external_walls", {})
-    iw      = data.get("internal_walls", {})
-    doors   = data.get("doors", {})
-    windows = data.get("windows", {})
-    zones   = data.get("zones", {})
-    summary = data.get("summary", {})
- 
-    print("\n── FLOOR PLAN TOPOLOGY ──────────────────────────", file=sys.stderr)
-    print(f"  External Walls : {summary.get('total_external_walls', len(ew))}", file=sys.stderr)
-    print(f"  Internal Walls : {summary.get('total_internal_walls', len(iw))}", file=sys.stderr)
-    print(f"  Doors          : {summary.get('total_doors', len(doors))}", file=sys.stderr)
-    print(f"  Windows        : {summary.get('total_windows', len(windows))}", file=sys.stderr)
-    print(f"  Zones          : {summary.get('total_zones', len(zones))}", file=sys.stderr)
- 
-    print("\n  External Wall Connections:", file=sys.stderr)
-    for ew_id, ew_info in ew.items():
-        pos  = ew_info.get("position", "?")
-        conn = ew_info.get("connected", {})
-        print(
-            f"    {ew_id} ({pos})  iw={conn.get('internal_walls',[])}  "
-            f"d={conn.get('doors',[])}  w={conn.get('windows',[])}",
-            file=sys.stderr,
-        )
- 
-    print("\n  Internal Wall Connections:", file=sys.stderr)
-    for iw_id, iw_info in iw.items():
-        conn = iw_info.get("connected", {})
-        print(
-            f"    {iw_id}  connects_ew={iw_info.get('connects_external',[])}  "
-            f"d={conn.get('doors',[])}  w={conn.get('windows',[])}",
-            file=sys.stderr,
-        )
- 
-    print("\n  Zone Connections:", file=sys.stderr)
-    for zone_id, zone_info in zones.items():
-        label = zone_info.get("label", zone_id)
-        ew_c  = zone_info.get("connected_external_walls", [])
-        iw_c  = zone_info.get("connected_internal_walls", [])
-        total = zone_info.get("total_walls_connected", 0)
-        wins  = zone_info.get("windows", [])
-        drrs  = zone_info.get("doors", [])
-        print(
-            f"    {zone_id} ({label})  total_walls={total}  "
-            f"ew={ew_c}  iw={iw_c}  windows={wins}  doors={drrs}",
-            file=sys.stderr,
-        )
- 
-    print("─────────────────────────────────────────────────\n", file=sys.stderr)
- 
- 
-# ─────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────
- 
-def main():
-    parser = argparse.ArgumentParser(description="Floor plan OCR via Claude Vision")
-    parser.add_argument("image", help="Path to floor plan image")
-    parser.add_argument("--output", "-o", help="Write JSON to this file")
-    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
-    args = parser.parse_args()
- 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        print("Error: ANTHROPIC_API_KEY environment variable not set", file=sys.stderr)
-        sys.exit(1)
- 
-    if not os.path.isfile(args.image):
-        print(f"Error: File not found: {args.image}", file=sys.stderr)
-        sys.exit(1)
- 
-    print(f"Processing: {args.image}", file=sys.stderr)
- 
-    raw_data    = call_claude_vision(args.image, api_key)
-    final_data  = post_process(raw_data)
-    print_topology(final_data)
- 
-    indent = 2 if args.pretty else None
-    json_out = json.dumps(final_data, indent=indent)
- 
-    if args.output:
-        with open(args.output, "w") as f:
-            f.write(json_out)
-        print(f"Saved to: {args.output}", file=sys.stderr)
+import json
+import numpy as np
+import math
+import sys
+from collections import defaultdict
+from pdf2image import convert_from_path
+
+# ================= SETTINGS =================
+MIN_CONF = 0.30
+reader = easyocr.Reader(['en'], gpu=False)
+input_path = sys.argv[1]
+
+# ================= LOAD IMAGE / PDF =================
+if input_path.lower().endswith(".pdf"):
+    pages = convert_from_path(input_path, dpi=500)
+else:
+    img = cv2.imread(input_path)
+    pages = [img] if img is not None else []
+
+elements = []
+
+# ================= PREPROCESS =================
+def preprocess(img):
+    if isinstance(img, np.ndarray):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
     else:
-        print(json_out)
- 
- 
-if __name__ == "__main__":
-    main()
+        gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    _, th = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+    return th
+
+# ================= OCR =================
+for page in pages:
+    image = cv2.cvtColor(np.array(page), cv2.COLOR_RGB2BGR) if not isinstance(page, np.ndarray) else page
+    processed = preprocess(image)
+    results = reader.readtext(processed)
+    for (bbox, text, prob) in results:
+        if prob < MIN_CONF:
+            continue
+        text = text.upper().strip()
+        x = int(sum([p[0] for p in bbox]) / 4)
+        y = int(sum([p[1] for p in bbox]) / 4)
+        elements.append({"text": text, "x": x, "y": y})
+
+# ================= CLEAN TEXT =================
+def clean(t):
+    t = t.upper()
+    t = t.replace("-", "=").replace("_", "")
+    t = t.replace("H-", "H=").replace("T-", "T=")
+    t = t.replace("D-", "D=").replace("W-", "W=")
+    t = t.replace("1W", "IW").replace("lW", "IW").replace("lw", "IW")
+    return t.strip()
+
+for e in elements:
+    e["text"] = clean(e["text"])
+
+# ================= HELPERS =================
+def dist(a, b):
+    return math.hypot(a["x"] - b["x"], a["y"] - b["y"])
+
+def is_duplicate(x, y, positions, th=40):
+    return any(abs(x - px) < th and abs(y - py) < th for px, py in positions)
+
+def get_nearby(base, radius=200):
+    return [e for e in elements if dist(base, e) < radius]
+
+def find_val(nearby, pattern):
+    for e in nearby:
+        m = re.search(pattern, e["text"])
+        if m:
+            return int(m.group(1))
+    return None
+
+def parse_feet_inches(text):
+    text = text.replace(" ", "")
+    feet_m = re.search(r"(\d+)'", text)
+    if not feet_m:
+        return None
+    feet = int(feet_m.group(1))
+    inch_m = re.search(r"'(\d+)", text)
+    frac_m = re.search(r"(\d+)/(\d+)", text)
+    inches = int(inch_m.group(1)) if inch_m else 0
+    frac = int(frac_m.group(1)) / int(frac_m.group(2)) if frac_m else 0
+    if inches > 12:
+        inches = int(str(inches)[0])
+    return math.ceil(feet + (inches + frac) / 12)
+
+# ================= STEP 1: EXTERNAL WALLS =================
+ew_anchors, ew_positions = [], []
+for e in elements:
+    txt = e["text"]
+    if re.match(r"^EW[\s,.<>:=\-]?\d+$", txt) or re.match(r"^EW\d+$", txt):
+        if not is_duplicate(e["x"], e["y"], ew_positions):
+            ew_anchors.append(e)
+            ew_positions.append((e["x"], e["y"]))
+
+external_walls = {}
+for i, anchor in enumerate(ew_anchors):
+    eid = f"ew{i+1}"
+    nearby = get_nearby(anchor, 250)
+    t_val = find_val(nearby, r"T[=\s](\d+)")
+    h_val = find_val(nearby, r"H[=\s](\d+)")
+    l_val = find_val(nearby, r"L[=\s](\d+)")
+    external_walls[eid] = {
+        "id": eid,
+        "thickness_in": t_val,
+        "height_ft": h_val,
+        "length_ft": l_val,
+        "connected": {
+            "windows": [],
+            "doors": [],
+            "internal_walls": []
+        }
+    }
+
+# ================= STEP 2: INTERNAL WALLS =================
+iw_anchors, iw_positions = [], []
+for e in elements:
+    txt = e["text"]
+    if re.match(r"^IW[\s,.<>:=\-]?\d+$", txt) or re.match(r"^IW\d+$", txt):
+        if not is_duplicate(e["x"], e["y"], iw_positions):
+            iw_anchors.append(e)
+            iw_positions.append((e["x"], e["y"]))
+
+internal_walls = {}
+for i, anchor in enumerate(iw_anchors):
+    iwid = f"iw{i+1}"
+    nearby = get_nearby(anchor, 250)
+    t_val = find_val(nearby, r"T[=\s](\d+)")
+    h_val = find_val(nearby, r"H[=\s](\d+)")
+    l_val = find_val(nearby, r"L[=\s](\d+)")
+    connects_external = []
+    for k, ew_anchor in enumerate(ew_anchors):
+        if dist(anchor, ew_anchor) < 600:
+            connects_external.append(f"ew{k+1}")
+    internal_walls[iwid] = {
+        "id": iwid,
+        "thickness_in": t_val,
+        "height_ft": h_val,
+        "length_ft": l_val,
+        "connects_external": connects_external,
+        "connected": {
+            "doors": [],
+            "windows": []
+        }
+    }
+
+# ================= STEP 3: DOORS =================
+door_list = []
+door_positions = []
+for e in elements:
+    txt = e["text"]
+    m = re.match(r"D[=\s]?(\d+)[xX](\d+)", txt)
+    if m:
+        if not is_duplicate(e["x"], e["y"], door_positions):
+            door_list.append({
+                "id": f"d{len(door_list)+1}",
+                "x": e["x"], "y": e["y"],
+                "width_ft": int(m.group(1)),
+                "height_ft": int(m.group(2))
+            })
+            door_positions.append((e["x"], e["y"]))
+    elif re.match(r"^D\d+$", txt):
+        nearby = get_nearby(e, 150)
+        w = find_val(nearby, r"(\d+)[xX]\d+") or 3
+        h = find_val(nearby, r"\d+[xX](\d+)") or 7
+        if not is_duplicate(e["x"], e["y"], door_positions):
+            door_list.append({
+                "id": f"d{len(door_list)+1}",
+                "x": e["x"], "y": e["y"],
+                "width_ft": w,
+                "height_ft": h
+            })
+            door_positions.append((e["x"], e["y"]))
+
+# ================= STEP 4: WINDOWS =================
+window_list = []
+window_positions = []
+for e in elements:
+    txt = e["text"]
+    m = re.match(r"W[=\s]?(\d+)[xX](\d+)", txt)
+    if m:
+        if not is_duplicate(e["x"], e["y"], window_positions):
+            window_list.append({
+                "id": f"w{len(window_list)+1}",
+                "x": e["x"], "y": e["y"],
+                "width_ft": int(m.group(1)),
+                "height_ft": int(m.group(2))
+            })
+            window_positions.append((e["x"], e["y"]))
+    elif re.match(r"^W\d+$", txt):
+        nearby = get_nearby(e, 150)
+        w = find_val(nearby, r"(\d+)[xX]\d+") or 4
+        h = find_val(nearby, r"\d+[xX](\d+)") or 4
+        if not is_duplicate(e["x"], e["y"], window_positions):
+            window_list.append({
+                "id": f"w{len(window_list)+1}",
+                "x": e["x"], "y": e["y"],
+                "width_ft": w,
+                "height_ft": h
+            })
+            window_positions.append((e["x"], e["y"]))
+
+# ================= STEP 5: ASSIGN on_wall + BACK-FILL =================
+def find_nearest_wall(pos):
+    best_wall = None
+    best_d = 999999
+    for k, ew_anchor in enumerate(ew_anchors):
+        dd = dist(pos, ew_anchor)
+        if dd < best_d:
+            best_d = dd
+            best_wall = f"ew{k+1}"
+    for j, iw_anchor in enumerate(iw_anchors):
+        dd = dist(pos, iw_anchor)
+        if dd < best_d:
+            best_d = dd
+            best_wall = f"iw{j+1}"
+    return best_wall
+
+doors_output = {}
+for d in door_list:
+    on_wall = find_nearest_wall({"x": d["x"], "y": d["y"]})
+    doors_output[d["id"]] = {
+        "id": d["id"],
+        "width_ft": d["width_ft"],
+        "height_ft": d["height_ft"],
+        "on_wall": on_wall
+    }
+    if on_wall:
+        wall = external_walls.get(on_wall) or internal_walls.get(on_wall)
+        if wall and d["id"] not in wall["connected"]["doors"]:
+            wall["connected"]["doors"].append(d["id"])
+
+windows_output = {}
+for w in window_list:
+    on_wall = find_nearest_wall({"x": w["x"], "y": w["y"]})
+    windows_output[w["id"]] = {
+        "id": w["id"],
+        "width_ft": w["width_ft"],
+        "height_ft": w["height_ft"],
+        "on_wall": on_wall
+    }
+    if on_wall:
+        wall = external_walls.get(on_wall) or internal_walls.get(on_wall)
+        if wall and w["id"] not in wall["connected"]["windows"]:
+            wall["connected"]["windows"].append(w["id"])
+
+# Back-fill iw → ew connected.internal_walls
+for j, iw_anchor in enumerate(iw_anchors):
+    iwid = f"iw{j+1}"
+    for k, ew_anchor in enumerate(ew_anchors):
+        ewid = f"ew{k+1}"
+        if dist(iw_anchor, ew_anchor) < 600:
+            if iwid not in external_walls[ewid]["connected"]["internal_walls"]:
+                external_walls[ewid]["connected"]["internal_walls"].append(iwid)
+
+# ================= STEP 6: ZONES =================
+zone_pattern = r"^ZONE\s*\d+[A-Z]?$"
+room_keywords = ["BEDROOM","BATHROOM","KITCHEN","LIVING","DINING","POOJA",
+                 "HALL","BALCONY","STORE","TOILET","LOBBY","STUDY","MBR",
+                 "M.BEDROOM","C.BEDROOM","MASTER"]
+zones_output = {}
+
+def nearest_room_name(base, radius=300):
+    for e in sorted(elements, key=lambda e: dist(base, e)):
+        if dist(base, e) > radius:
+            break
+        for kw in room_keywords:
+            if kw in e["text"]:
+                return e["text"]
+    return "UNKNOWN"
+
+def parse_zone_size(base, radius=400):
+    for e in elements:
+        if dist(base, e) < radius:
+            m = re.search(r"(\d+'\d+(?:\s*\d+/\d+)?\"?)\s*[xX]\s*(\d+'\d+(?:\s*\d+/\d+)?\"?)", e["text"])
+            if m:
+                ww = parse_feet_inches(m.group(1))
+                ll = parse_feet_inches(m.group(2))
+                if ww and ll and 5 <= ww <= 50 and 5 <= ll <= 50:
+                    return min(ww, ll), max(ww, ll)
+            m2 = re.search(r"(\d{1,2})\s*[xX]\s*(\d{1,2})", e["text"])
+            if m2:
+                ww, ll = int(m2.group(1)), int(m2.group(2))
+                if 5 <= ww <= 40 and 5 <= ll <= 40:
+                    return min(ww, ll), max(ww, ll)
+    return None, None
+
+for e in elements:
+    if re.match(zone_pattern, e["text"]):
+        zid = re.sub(r"\s+", "", e["text"])
+        room_name = nearest_room_name(e)
+        width_ft, length_ft = parse_zone_size(e)
+        area = round(width_ft * length_ft, 2) if width_ft and length_ft else None
+
+        connected_ew = list(dict.fromkeys(
+            f"ew{k+1}" for k, ew_anchor in enumerate(ew_anchors)
+            if dist(e, ew_anchor) < 500
+        ))
+        connected_iw = list(dict.fromkeys(
+            f"iw{j+1}" for j, iw_anchor in enumerate(iw_anchors)
+            if dist(e, iw_anchor) < 400
+        ))
+        connected_doors = list(dict.fromkeys(
+            d["id"] for d in door_list
+            if dist(e, {"x": d["x"], "y": d["y"]}) < 400
+        ))
+        connected_windows = list(dict.fromkeys(
+            w["id"] for w in window_list
+            if dist(e, {"x": w["x"], "y": w["y"]}) < 400
+        ))
+
+        zones_output[zid] = {
+            "id": zid,
+            "label": room_name,
+            "width_ft": width_ft,
+            "length_ft": length_ft,
+            "area_sqft": area,
+            "connected_external_walls": connected_ew,
+            "connected_internal_walls": connected_iw,
+            "total_walls_connected": len(connected_ew) + len(connected_iw),
+            "doors": connected_doors,
+            "windows": connected_windows
+        }
+
+# ================= FINAL OUTPUT =================
+final = {
+    "external_walls": external_walls,
+    "internal_walls": internal_walls,
+    "doors": doors_output,
+    "windows": windows_output,
+    "zones": zones_output,
+    "summary": {
+        "total_external_walls": len(external_walls),
+        "total_internal_walls": len(internal_walls),
+        "total_doors": len(doors_output),
+        "total_windows": len(windows_output),
+        "total_zones": len(zones_output),
+        "total_area_sqft": round(
+            sum(z["area_sqft"] for z in zones_output.values() if z["area_sqft"]), 2
+        )
+    }
+}
+
+print(json.dumps(final)) 
