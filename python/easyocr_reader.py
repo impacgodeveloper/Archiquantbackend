@@ -614,7 +614,7 @@ def _auto_px_per_ft():
             # This label is near the edge — use img_w as the pixel span
             return img_w / total_ft
         # Imperial: "50'0"" total dimension
-        m = re.search(r"(\d+)'0"?\s*[xX×*]\s*(\d+)'0"?", t)
+        m = re.search(r"(\d+)'\d*\s*[xX*]\s*(\d+)'\d*", t)
         if m:
             w_ft = float(m.group(1))
             h_ft = float(m.group(2))
