@@ -37,25 +37,49 @@ img_w = max((e["x"] for e in elements), default=1000) * 1.1
 # ── Clean ─────────────────────────────────────────────────────────────────────
 def clean(t):
     t = t.upper().strip()
-    # Fix wall labels
+
+    # ── Fix wall labels ───────────────────────────────────────────────
     t = t.replace("1W","IW").replace("lW","IW").replace("|W","IW")
     t = re.sub(r"\bEW,\b","EW",t)
-    # EWA→EW4 (digit/letter confusion)
+
+    # ── Fix stuck EW/IW labels: "EWT=9" → "EW T=9" ──────────────────
+    t = re.sub(r'^(EW|IW)(T[=\-])', r'\1 \2', t)
+
+    # ── EWA→EW4 (digit/letter confusion in numbered EW labels) ───────
     _ld = {'A':'4','B':'2','C':'3','S':'5','G':'6','I':'1','O':'0'}
     t = re.sub(r'^EW([A-Z])$', lambda m: 'EW'+_ld.get(m.group(1),m.group(1)), t)
-    # Dash→equals in specs: T-9→T=9, H-10→H=10
-    t = re.sub(r'\b([TH])-(\d)', r'\1=\2', t)
-    t = re.sub(r'\b([DW])-(\d)', r'\1=\2', t)
-    # Normalize dimension separator → X
-    t = t.replace('×','X').replace('*','X').replace('x','X')
-    # Remove spaces around X in dims: "10' X 10'" → "10'X10'"
+
+    # ── Dash→equals in specs: T-9→T=9, H-10→H=10 ────────────────────
+    t = re.sub(r'\b([TH])[-]([0-9])', r'\1=\2', t)
+    t = re.sub(r'\b([DW])[-]([0-9])', r'\1=\2', t)
+
+    # ── Fix "lo" / "l0" OCR misread of "10" ─────────────────────────
+    # H-lo → H=10, H=lo → H=10
+    t = re.sub(r'H[=\-][Ll][oO0]', 'H=10', t)
+    t = re.sub(r'H[=\-][Ll](\d)', r'H=1\1', t)
+    # Fix letter O as digit 0 in specs: H=1O → H=10, T=O → T=0
+    t = re.sub(r'([TH]=\d*)O\b', lambda m: m.group(0)[:-1]+'0', t)
+
+    # ── Normalize all dimension separators → X ────────────────────────
+    t = t.replace('×','X').replace('*','X')
+    # 'xl' OCR misread fix: 12'xl4' -> 12'X14'
+    t = re.sub(r"xl(\d)", r"X\g<1>", t)
+    t = re.sub(r"(\d)xl", r"\g<1>X", t)
+    # lowercase x between digits → X
+    t = re.sub(r"(\d)x(\d)", r"\1X\2", t)
+    # Remove spaces around X: "10' X 10'" → "10'X10'"
     t = re.sub(r"(\d)\s+X\s+(\d)", r"\1X\2", t)
-    # Remove trailing apostrophe after dim: "4X4'" → "4X4"
+
+    # ── Clean up dimension apostrophes ────────────────────────────────
+    # Remove trailing apostrophe after complete dim: "4X4'" → "4X4"
     t = re.sub(r"(\d+X\d+)'$", r"\1", t)
-    # Fix garbled specs
+    # Normalize fancy quotes to standard apostrophe
+    t = t.replace("\u2018","'").replace("\u2019","'").replace("\u201c",'"').replace("\u201d",'"')
+
+    # ── Fix garbled specs ─────────────────────────────────────────────
     t = re.sub(r'\bTZ(\d)', r'T=\1', t)
-    t = re.sub(r'H-L(\d)', r'H=1\1', t)
     t = t.replace("T-G","T=9").replace("T=G","T=9")
+
     t = re.sub(r'\s+', ' ', t).strip()
     return t
 
